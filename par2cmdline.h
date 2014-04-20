@@ -245,6 +245,7 @@ typedef enum Result
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <memory>
 
 #include <ctype.h>
 #include <iostream>
@@ -258,6 +259,56 @@ using namespace std;
 #undef offsetof
 #endif
 #define offsetof(TYPE, MEMBER) ((size_t) ((char*)(&((TYPE *)1)->MEMBER) - (char*)1))
+
+#define WANT_CONCURRENT                     1
+#define WANT_CONCURRENT_PAR2_FILE_OPENING   1
+#define WANT_CONCURRENT_SOURCE_VERIFICATION 1
+
+#if WANT_CONCURRENT
+  #include "tbb/task_scheduler_init.h"
+  #include "tbb/atomic.h"
+  #include "tbb/concurrent_hash_map.h"
+  #include "tbb/concurrent_vector.h"
+  #include "tbb/tick_count.h"
+  #include "tbb/blocked_range.h"
+  #include "tbb/parallel_for.h"
+  #include "tbb/mutex.h"
+  #include "tbb/pipeline.h"
+
+  class CTimeInterval {
+  public:
+    CTimeInterval(const std::string& label) :
+      _label(label), _start(tbb::tick_count::now()), _done(false) {}
+    ~CTimeInterval(void) {  emit();  }
+    void  suppress_emission(void) { _done = true; }
+    void  emit(void) {
+      if (!_done) {
+        _done  =  true;
+        tbb::tick_count  end  =  tbb::tick_count::now();
+        cout << _label << " took " << (end-_start).seconds() << " seconds." << endl;
+      }
+    }
+  private:
+    std::string     _label;
+    tbb::tick_count _start;
+    bool            _done;
+  };
+
+  template <typename T>
+  struct intptr_hasher {
+    static  size_t  hash(T i) { return static_cast<size_t> (31 + (size_t) i * 17); }
+    static  bool  equal( T x, T y ) { return x == y; }
+  };
+
+  typedef intptr_hasher<u32>    u32_hasher;
+//typedef intptr_hasher<size_t> size_t_hasher;
+
+  #if HAVE_ASYNC_IO
+    #define CONCURRENT_PIPELINE 1
+  #endif
+
+  enum { ALL_SERIAL, CHECKSUM_SERIALLY_BUT_PROCESS_CONCURRENTLY, ALL_CONCURRENT };
+#endif
 
 #include "letype.h"
 // par2cmdline includes
@@ -285,6 +336,8 @@ using namespace std;
 
 #include "filechecksummer.h"
 #include "verificationhashtable.h"
+
+#include "pipeline.h"
 
 #include "par2creator.h"
 #include "par2repairer.h"

@@ -21,6 +21,7 @@ bin_PROGRAMS = par2
 man_MANS = par2.1
 
 par2_SOURCES = par2cmdline.cpp par2cmdline.h \
+	buffer.cpp buffer.h \
 	commandline.cpp commandline.h \
 	crc.cpp crc.h \
 	creatorpacket.cpp creatorpacket.h \
@@ -41,12 +42,13 @@ par2_SOURCES = par2cmdline.cpp par2cmdline.h \
 	par2fileformat.cpp par2fileformat.h \
 	par2repairer.cpp par2repairer.h \
 	par2repairersourcefile.cpp par2repairersourcefile.h \
+	pipeline.cpp pipeline.h \
 	recoverypacket.cpp recoverypacket.h \
 	reedsolomon.cpp reedsolomon.h \
 	verificationhashtable.cpp verificationhashtable.h \
 	verificationpacket.cpp verificationpacket.h
 
-LDADD = -lstdc++
+LDADD = -lstdc++ -ltbb -lrt
 AM_CXXFLAGS = -Wall
 
 EXTRA_DIST = PORTING ROADMAP par2cmdline.sln par2cmdline.vcproj \

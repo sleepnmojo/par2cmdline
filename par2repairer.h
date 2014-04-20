@@ -20,6 +20,75 @@
 #ifndef __PAR2REPAIRER_H__
 #define __PAR2REPAIRER_H__
 
+#define DSTOUT                0
+
+#if WANT_CONCURRENT
+  struct string_hasher {
+    static  size_t  hash(const std::string& x) {
+      size_t h = 0;
+      for (const char* s = x.c_str(); *s; ++s)
+        h = (h*17)^*s;
+      return h;
+    }
+    static  bool  equal( const std::string& x, const std::string& y ) { return x == y; }
+  };
+
+  struct istring_hasher {
+    static  size_t  hash(const std::string& x) {
+      size_t h = 0;
+      for (const char* s = x.c_str(); *s; ++s)
+        h = (h*17)^ tolower(*s);
+      return h;
+    }
+    static  bool  equal( const std::string& x, const std::string& y )
+    { return x.length() == y.length() && 0 == stricmp(x.c_str(), y.c_str()); }
+  };
+
+  template <typename T>
+  struct atomic_ptr : tbb::atomic<T> {
+    // wow - C++ sometimes really is ugly...
+    T  operator->(void) { return tbb::atomic<T>::operator typename tbb::atomic<T>::value_type(); }
+    atomic_ptr<T>&  operator=(T t) { tbb::atomic<T>::operator=(t); return *this; }
+  };
+
+  class ConcurrentDiskFileMap {
+  public:
+  #if defined(WIN32) || defined(__APPLE_CC__)
+    typedef tbb::concurrent_hash_map<string, DiskFile*, istring_hasher>  map_type;
+  #else
+    typedef tbb::concurrent_hash_map<string, DiskFile*, string_hasher>  map_type;
+  #endif
+    ConcurrentDiskFileMap(void) {}
+    ~ConcurrentDiskFileMap(void) {
+      map_type::iterator fi;
+      for (fi = _diskfilemap.begin(); fi != _diskfilemap.end(); ++fi)
+        delete (*fi).second;
+    }
+
+    bool  Insert(DiskFile *diskfile) {
+      assert(!diskfile->FileName().empty());
+      map_type::accessor  a;
+      (bool) _diskfilemap.insert(a, diskfile->FileName());
+      a->second = diskfile;
+      return true;
+    }
+    void Remove(DiskFile *diskfile) {
+      assert(!diskfile->FileName().empty());
+      (bool) _diskfilemap.erase(diskfile->FileName());
+    }
+    DiskFile* Find(string filename) const {
+      assert(!filename.empty());
+      map_type::const_accessor  a;
+      return _diskfilemap.find(a, filename) ?  a->second : NULL;
+    }
+
+  protected:
+    map_type _diskfilemap;             // Map from filename to DiskFile
+  };
+
+  //#include  <ctype.h>
+#endif
+
 class Par2Repairer
 {
 public:
@@ -31,8 +100,24 @@ public:
 protected:
   // Steps in verifying and repairing files:
 
+#if WANT_CONCURRENT
+public:
+  #if WANT_CONCURRENT_SOURCE_VERIFICATION
+  void VerifyOneSourceFile(Par2RepairerSourceFile *sourcefile, string basepath, bool& finalresult);
+  void VerifyOneTargetFile(Par2RepairerSourceFile *sourcefile, string basepath, bool& finalresult);
+  #endif
+  void ProcessDataForOutputIndex(u32 outputstartindex, u32 outputendindex, size_t blocklength,
+                                 u32 inputindex, buffer& inputbuffer);
+  void ProcessDataConcurrently(size_t blocklength, u32 inputindex, buffer& inputbuffer);
+#endif
   // Load packets from the specified file
   bool LoadPacketsFromFile(string filename);
+#if WANT_CONCURRENT
+protected:
+  void* OutputBufferAt(u32 outputindex);
+  bool ProcessDataForOutputIndex_(u32 outputindex, u32 outputendindex, size_t blocklength,
+                                  u32 inputindex, buffer& inputbuffer);
+#endif
   // Finish loading a recovery packet
   bool LoadRecoveryPacket(DiskFile *diskfile, u64 offset, PACKET_HEADER &header);
   // Finish loading a file description packet
@@ -133,12 +218,19 @@ protected:
   bool                      firstpacket;             // Whether or not a valid packet has been found.
   MD5Hash                   setid;                   // The SetId extracted from the first packet.
 
+#if WANT_CONCURRENT
+  tbb::concurrent_hash_map<u32, RecoveryPacket*, u32_hasher> recoverypacketmap;       // One recovery packet for each exponent value.
+  ::atomic_ptr<MainPacket*>    mainpacket;           // One copy of the main packet.
+  ::atomic_ptr<CreatorPacket*> creatorpacket;        // One copy of the creator packet.
+
+  ConcurrentDiskFileMap     diskFileMap;
+#else
   map<u32, RecoveryPacket*> recoverypacketmap;       // One recovery packet for each exponent value.
   MainPacket               *mainpacket;              // One copy of the main packet.
   CreatorPacket            *creatorpacket;           // One copy of the creator packet.
 
   DiskFileMap               diskFileMap;
-
+#endif
   map<MD5Hash,Par2RepairerSourceFile*> sourcefilemap;// Map from FileId to SourceFile
   vector<Par2RepairerSourceFile*>      sourcefiles;  // The source files
   vector<Par2RepairerSourceFile*>      verifylist;   // Those source files that are being repaired
@@ -173,11 +265,43 @@ protected:
 
   ReedSolomon<Galois16>     rs;                      // The Reed Solomon matrix.
 
-  void                     *inputbuffer;             // Buffer for reading DataBlocks (chunksize)
   void                     *outputbuffer;            // Buffer for writing DataBlocks (chunksize * missingblockcount)
+#if WANT_CONCURRENT
+  #if CONCURRENT_PIPELINE
+  // low bit: which half of each entry in outputbuffer contains valid data (if DSTOUT is 1)
+  // high bit: whether entry in outputbuffer is in use (0 = available, 1 = in-use)
+  std::vector< tbb::atomic<int> > outputbuffer_element_state_; // state of each entry of outputbuffer
+  size_t                   aligned_chunksize_;
+  #else
+  buffer                    inputbuffer;
+//void                     *inputbuffer;             // Buffer for reading DataBlocks (chunksize)
+  #endif
 
+  // 32-bit PowerPC does not support tbb::atomic<u64> because it requires the ldarx
+  // instruction which is only available for 64-bit PowerPC CPUs, so...
+  #if __GNUC__ &&  __ppc__
+  // this won't cause any data corruption - it will only cause (possibly) incorrect progress values to be printed
   u64                       progress;                // How much data has been processed.
+  #else
+  tbb::atomic<u64>          progress;                // How much data has been processed.
+  #endif
+#else
+  buffer                    inputbuffer;
+//  void                     *inputbuffer;             // Buffer for reading DataBlocks (chunksize)
+
+  #if DSTOUT
+  std::vector<int>          outputbuffer_element_state_; // state of each entry of outputbuffer
+  #endif
+  u64                       progress;                // How much data has been processed.
+#endif
   u64                       totaldata;               // Total amount of data to be processed.
+
+#if WANT_CONCURRENT
+  unsigned                  concurrent_processing_level;
+  tbb::mutex                cout_mutex;
+  tbb::atomic<u32>          cout_in_use;             // when repairing, this is used to display % done w/o blocking a thread
+  tbb::tick_count           last_cout;   // when cout was used for output
+#endif
 };
 
 #endif // __PAR2REPAIRER_H__

@@ -50,7 +50,11 @@ Par2CreatorSourceFile::~Par2CreatorSourceFile(void)
 // 16k of the file, and then compute the FileId and store the results
 // in a file description packet and a file verification packet.
 
-bool Par2CreatorSourceFile::Open(CommandLine::NoiseLevel noiselevel, const CommandLine::ExtraFile &extrafile, u64 blocksize, bool deferhashcomputation, string basepath)
+bool Par2CreatorSourceFile::Open(CommandLine::NoiseLevel noiselevel, const CommandLine::ExtraFile &extrafile, u64 blocksize, bool deferhashcomputation, string basepath
+#if WANT_CONCURRENT_PAR2_FILE_OPENING
+  , tbb::mutex& cout_mutex, tbb::tick_count& last_cout
+#endif
+  )
 {
   // Get the filename and filesize
   diskfilename = extrafile.FileName();
@@ -207,13 +211,24 @@ bool Par2CreatorSourceFile::Open(CommandLine::NoiseLevel noiselevel, const Comma
 
       if (noiselevel > CommandLine::nlQuiet)
       {
+#if WANT_CONCURRENT_PAR2_FILE_OPENING
+        tbb::tick_count now = tbb::tick_count::now();
+        if ((now - last_cout).seconds() >= 0.1) { // only update every 0.1 seconds
+#endif
         // Display progress
         u32 oldfraction = (u32)(1000 * offset / filesize);
         u32 newfraction = (u32)(1000 * (offset + want) / filesize);
         if (oldfraction != newfraction)
         {
+#if WANT_CONCURRENT_PAR2_FILE_OPENING
+            last_cout = now;
+            tbb::mutex::scoped_lock l(cout_mutex);
+#endif
           cout << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
         }
+#if WANT_CONCURRENT_PAR2_FILE_OPENING
+       }
+#endif
       }
 
       offset += want;

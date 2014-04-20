@@ -106,6 +106,10 @@ public:
   u64                    GetTotalSourceSize(void) const    {return totalsourcesize;}
   CommandLine::NoiseLevel GetNoiseLevel(void) const        {return noiselevel;}
 
+#if WANT_CONCURRENT
+  unsigned               GetConcurrentProcessingLevel(void) const { return concurrent_processing_level; }
+#endif
+
   string                              GetParFilename(void) const {return parfilename;}
   string                              GetBasePath(void) const {return basepath;}
   const list<CommandLine::ExtraFile>& GetExtraFiles(void) const  {return extrafiles;}
@@ -158,6 +162,13 @@ protected:
   size_t memorylimit;          // How much memory is permitted to be used
                                // for the output buffer when creating
                                // or repairing.
+
+#if WANT_CONCURRENT
+  // although it is possible to specify how many threads that TBB should
+  // use, that functionality is not implemented (and the TBB documentation
+  // recommends not using it in production code), so this is merely a bool:
+  unsigned concurrent_processing_level; // whether to process serially or concurrently
+#endif
 
   bool purgefiles;             // purge backup and par files on successfull
                                // recovery

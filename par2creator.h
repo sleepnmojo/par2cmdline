@@ -36,6 +36,17 @@ public:
 protected:
   // Steps in the creation process:
 
+#if WANT_CONCURRENT
+public:
+  void ProcessDataForOutputIndex(u32 outputstartindex, u32 outputendindex, size_t blocklength, u32 inputblock, buffer& ib);
+  void ProcessDataConcurrently(size_t blocklength, u32 inputblock, buffer& ib);
+  #if WANT_CONCURRENT_PAR2_FILE_OPENING
+  Par2CreatorSourceFile* OpenSourceFile(const CommandLine::ExtraFile &extrafile, string basepath);
+  #endif
+protected:
+  void* OutputBufferAt(u32 outputindex);
+  bool ProcessDataForOutputIndex_(u32 outputblock, u32 outputendblock, size_t blocklength, u32 inputblock, buffer& ib);
+#endif
   // Compute block size from block count or vice versa depending on which was
   // specified on the command line
   bool ComputeBlockSizeAndBlockCount(const list<CommandLine::ExtraFile> &extrafiles);
@@ -97,7 +108,36 @@ protected:
   size_t chunksize;   // How much of each block will be processed at a 
                       // time (due to memory constraints).
 
-  void *inputbuffer;  // chunksize
+#if WANT_CONCURRENT
+  #if CONCURRENT_PIPELINE
+  // low bit: which half of each entry in outputbuffer contains valid data (if DSTOUT is 1)
+  // high bit: whether entry in outputbuffer is in use (0 = available, 1 = in-use)
+  std::vector< tbb::atomic<int> > outputbuffer_element_state_; // state of each entry of outputbuffer
+  size_t                   aligned_chunksize_;
+  #else
+  buffer                    inputbuffer;
+//void                     *inputbuffer;             // Buffer for reading DataBlocks (chunksize)
+  #endif
+
+  // 32-bit PowerPC does not support tbb::atomic<u64> because it requires the ldarx
+  // instruction which is only available for 64-bit PowerPC CPUs, so...
+  #if __GNUC__ &&  __ppc__
+  // this won't cause any data corruption - it will only cause (possibly) incorrect progress values to be printed
+  u64                       progress;                // How much data has been processed.
+  #else
+  tbb::atomic<u64>          progress;                // How much data has been processed.
+  #endif
+#else
+  buffer                    inputbuffer;
+//void                     *inputbuffer;             // Buffer for reading DataBlocks (chunksize)
+  #if DSTOUT
+  std::vector<int>          outputbuffer_element_state_; // state of each entry of outputbuffer
+  #endif
+
+  u64                       progress;                // How much data has been processed.
+#endif
+
+//  void *inputbuffer;  // chunksize
   void *outputbuffer; // chunksize * recoveryblockcount
   
   u32 sourcefilecount;   // Number of source files for which recovery data will be computed.
@@ -133,13 +173,21 @@ protected:
 
   ReedSolomon<Galois16> rs;   // The Reed Solomon matrix.
 
-  u64 progress;     // How much data has been processed.
+//  u64 progress;     // How much data has been processed.
   u64 totaldata;    // Total amount of data to be processed.
 
   bool deferhashcomputation; // If we have enough memory to compute all recovery data
                              // in one pass, then we can defer the computation of
                              // the full file hash and block crc and hashes until
                              // the recovery data is computed.
+
+#if WANT_CONCURRENT
+  unsigned                  concurrent_processing_level;
+  tbb::mutex                cout_mutex;
+  tbb::atomic<u32>          cout_in_use; // this is used to display % done w/o blocking a thread
+  tbb::tick_count           last_cout;   // when cout was used for output
+#endif
+
 };
 
 #endif // __PAR2CREATOR_H__

@@ -35,6 +35,17 @@ dnl Checks for programs.
 AC_PROG_CXX
 AC_PROG_INSTALL
 
+case "$gpgpu" in
+	cuda)
+		AM_CONDITIONAL(GPGPU_CUDA, true)
+		AC_DEFINE(GPGPU_CUDA, 1, [defined if nVidia CUDA is supported])
+		;;
+	*)
+		AM_CONDITIONAL(GPGPU_CUDA, false)
+		AH_TEMPLATE(GPGPU_CUDA, [defined if nVidia CUDA is supported])
+		;;
+esac
+
 dnl Checks for libraries.
 
 dnl Checks for header files.

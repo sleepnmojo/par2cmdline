@@ -72,6 +72,9 @@ CommandLine::CommandLine(void)
 , totalsourcesize(0)
 , largestsourcesize(0)
 , memorylimit(0)
+#if WANT_CONCURRENT
+, concurrent_processing_level(ALL_CONCURRENT) // whether to process everything serially or concurrently
+#endif
 , purgefiles(false)
 , recursive(false)
 {
@@ -88,6 +91,27 @@ void CommandLine::banner(void)
   cout << "Copyright (C) 2003 Peter Brian Clements." << endl
     << "Copyright (C) 2011-2012 Marcel Partap." << endl
     << "Copyright (C) 2012-2014 Ike Devolder." << endl
+#if WANT_CONCURRENT
+       << "Modifications for concurrent processing, Unicode support, and hierarchial" << endl
+       << "directory support are Copyright (c) 2007-2009 Vincent Tan." << endl
+       << "Concurrent processing utilises Intel Thread Building Blocks 2.0," << endl
+       << "Copyright (c) 2007-2008 Intel Corp." << endl
+  #if __x86_64__ || defined(WIN64)
+       << "Executing using the 64-bit x86 (AMD64) instruction set." << endl
+  #elif __i386__ || defined(WIN32)
+       << "Executing using the 32-bit x86 (IA32) instruction set." << endl
+  #elif __ppc64__
+       << "Executing using the 64-bit PowerPC (PPC64) instruction set." << endl
+  #elif __ppc__
+       << "Executing using the 32-bit PowerPC (PPC32) instruction set." << endl
+//#elif __alpha__
+//     << "Executing using the 32-bit Alpha (ALPHA) instruction set." << endl
+//#elif __mips__
+//     << "Executing using the 32-bit MIPS (MIPS) instruction set." << endl
+  #else
+       << "Executing using an unknown instruction set." << endl
+  #endif
+#endif
     << endl
     << "par2cmdline comes with ABSOLUTELY NO WARRANTY." << endl
     << endl
@@ -127,6 +151,12 @@ void CommandLine::usage(void)
     "  -m<n>    : Memory (in MB) to use\n"
     "  -v [-v]  : Be more verbose\n"
     "  -q [-q]  : Be more quiet (-q -q gives silence)\n"
+#if WANT_CONCURRENT
+	"  -t<+|0|->: Threaded processing. The options are:\n"
+	"     -t+ to checksum and create/repair concurrently - uses multiple threads - good for hard disk files - [default]\n"
+	"     -t0 to checksum serially but create/repair concurrently - good for slow media such as CDs/DVDs\n"
+	"     -t- to checksum/create/repair serially - uses a single thread - good for testing this program\n"
+#endif
     "  -p       : Purge backup files and par files on successful recovery or\n"
     "             when no recovery is needed\n"
     "  -R       : Recurse into subdirectories (only useful on create)\n"
@@ -592,6 +622,27 @@ bool CommandLine::Parse(int argc, char *argv[])
           }
           break;
 
+#if WANT_CONCURRENT
+        case 't':
+          {
+            switch (argv[0][2]) {
+            case '-':
+              concurrent_processing_level = ALL_SERIAL;
+              break;
+            case '0':
+              concurrent_processing_level = CHECKSUM_SERIALLY_BUT_PROCESS_CONCURRENTLY;
+              break;
+            case '+':
+              concurrent_processing_level = ALL_CONCURRENT;
+              break;
+            default:
+              cerr << "Expected -t+ (use multiple cores) or -t0 (checksum serially, process concurrently) or -t- (use single core)." << endl;
+              return false;
+            }
+          }
+          break;
+#endif
+
         case 'p':
           {
             if (operation != opRepair && operation != opVerify)
@@ -832,7 +883,12 @@ bool CommandLine::Parse(int argc, char *argv[])
     // Half of total physical memory
     memorylimit = (size_t)(TotalPhysicalMemory / 1048576 / 2);
 #else
+  #if WANT_CONCURRENT
+    // Assume 128MB (otherwise processing is slower)
+    memorylimit = 64;
+  #else
     memorylimit = 16;
+  #endif
 #endif
   }
   memorylimit *= 1048576;

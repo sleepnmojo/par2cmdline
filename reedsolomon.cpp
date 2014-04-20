@@ -101,8 +101,9 @@ template <> bool ReedSolomon<Galois8>::SetInput(u32 count)
   return true;
 }
 
-template <> bool ReedSolomon<Galois8>::InternalProcess(const Galois8 &factor, size_t size, const void *inputbuffer, void *outputbuffer)
+template <> bool ReedSolomon<Galois8>::InternalProcess(const Galois8 &factor, size_t size, buffer& ib, void *outputbuffer)
 {
+  const void *inputbuffer = ib.get();
 #ifdef LONGMULTIPLY
   // The 8-bit long multiplication tables
   Galois8 *table = glmt->tables;
@@ -260,8 +261,9 @@ template <> bool ReedSolomon<Galois16>::SetInput(u32 count)
   return true;
 }
 
-template<> bool ReedSolomon<Galois16>::InternalProcess(const Galois16 &factor, size_t size, const void *inputbuffer, void *outputbuffer)
+template<> bool ReedSolomon<Galois16>::InternalProcess(const Galois16 &factor, size_t size, buffer &ib, void *outputbuffer)
 {
+  const void *inputbuffer = ib.get();
 #ifdef LONGMULTIPLY
   // The 8-bit long multiplication tables
   Galois16 *table = glmt->tables;
@@ -312,6 +314,16 @@ template<> bool ReedSolomon<Galois16>::InternalProcess(const Galois16 &factor, s
     LH++;
     HH++;
   }
+
+  #if WANT_CONCURRENT && CONCURRENT_PIPELINE && GPGPU_CUDA
+  if (has_gpu_ && size >= sizeof(u32) && 0 == (size & (sizeof(u32)-1))) {
+    const size_t n = (size / sizeof(u32));
+    // when called from pipeline_state in par2pipeline.h, ib will always be an instance
+    // of pipeline_buffer and hence always an instance of rcbuffer:
+    if (cuda::Process(n, static_cast<rcbuffer&> (ib), lhTable, outputindex)) // EXECUTE
+      return eSuccess;
+  }
+  #endif
 
   // Treat the buffers as arrays of 32-bit unsigned ints.
   u32 *src = (u32 *)inputbuffer;

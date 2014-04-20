@@ -19,6 +19,197 @@
 
 #include "par2cmdline.h"
 
+#if WANT_CONCURRENT
+  #if CONCURRENT_PIPELINE
+    class create_buffer : public pipeline_buffer {
+      friend class create_pipeline_state;
+      friend class create_filter_read;
+      friend class create_filter_process;
+      Par2CreatorSourceFile* sourcefile_;
+      u32                    sourceindex_;
+    };
+
+    class create_pipeline_state : public pipeline_state<create_buffer> {
+    private:
+      friend class create_filter_read;
+      friend class create_filter_process;
+
+      vector<Par2CreatorSourceFile*>&              sourcefiles_;
+      // If we have defered computation of the file hash and block crc and hashes
+      // sourcefile and sourceindex will be used to update them during
+      // the main recovery block computation
+      vector<Par2CreatorSourceFile*>::iterator     sourcefile_;
+      u32                                          sourceindex_;
+      bool                                         deferhashcomputation_;
+
+      // Computing the MD5 hashes for each source file requires that the buffers be hashed in the
+      // correct order, which is not a certainty when the buffers are processed concurrently. To
+      // ensure that they are correctly hashed, the next-index for hashing is remembered in
+      // shm_value_type.first. If a buffer arrives out of order (ahead of when it should be used
+      // for hashing) then its hashing is deferred by inserting it into the idx_to_buffer_type
+      // hash_map and later used after the buffer corresponding to the next-index is processed.
+      typedef tbb::concurrent_hash_map< u32, create_buffer*, intptr_hasher<u32> > idx_to_buffer_type;
+      typedef std::pair<u32, idx_to_buffer_type>                                  shm_value_type;
+      typedef tbb::concurrent_hash_map<Par2CreatorSourceFile*, shm_value_type, intptr_hasher<Par2CreatorSourceFile*> > shm_type;
+      shm_type                                     shm_;
+
+#ifndef NDEBUG
+// only for checking that the hashing order is correct:
+typedef tbb::concurrent_hash_map< Par2CreatorSourceFile*, tbb::concurrent_vector<u32>, intptr_hasher<Par2CreatorSourceFile*> > record_type;
+record_type record_;
+#endif
+
+      void try_to_update_hashes(create_buffer* ib);
+
+    public:
+      create_pipeline_state(
+        size_t                                     max_tokens,
+        u64                                        chunksize,
+        u32                                        missingblockcount,
+        size_t                                     blocklength,
+        u64                                        blockoffset,
+        vector<DataBlock*>&                        inputblocks,
+        vector<Par2CreatorSourceFile*>&            sourcefiles,
+        bool                                       deferhashcomputation) :
+        pipeline_state<create_buffer>(max_tokens, chunksize, missingblockcount, blocklength, blockoffset, inputblocks),
+        sourcefiles_(sourcefiles), sourcefile_(sourcefiles.begin()), sourceindex_(0),
+        deferhashcomputation_(deferhashcomputation) {}
+
+#ifndef NDEBUG
+~create_pipeline_state(void) {
+  for (record_type::const_iterator it = record_.begin(); it != record_.end(); ++it)
+    for (tbb::concurrent_vector<u32>::const_iterator jt = (*it).second.begin(); jt != (*it).second.end(); ++jt) {
+      if (*jt != u32(jt - (*it).second.begin())) printf("%s: %u\n", (*it).first->get_diskfilename().c_str(), *jt);
+      assert(*jt == u32(jt - (*it).second.begin()));
+    }
+}
+#endif
+    };
+
+      void create_pipeline_state::try_to_update_hashes(create_buffer* ib) {
+        if (!deferhashcomputation_)
+          return;
+
+        assert(blockoffset() == 0 /* && blocklength() == blocksize */);
+        //assert(ib->sourcefile_ != sourcefiles_.end());
+
+        shm_type::accessor a;
+        idx_to_buffer_type::accessor ia;
+        if (shm_.insert(a, ib->sourcefile_)) {
+          a->second = shm_value_type(0, idx_to_buffer_type());
+#ifndef NDEBUG
+//printf("(%s 0) inserted into shm_\n", ib->sourcefile_->get_diskfilename().c_str());
+#endif
+        }
+
+#ifndef NDEBUG
+//printf("(%s %u) vs %u -> ", ib->sourcefile_->get_diskfilename().c_str(), ib->sourceindex_, a->second.first);
+#endif
+        if (a->second.first == ib->sourceindex_) {
+//printf("immed\n");
+          for (bool ib_needs_releasing = false; ; ) {
+            ib->sourcefile_->UpdateHashes(ib->sourceindex_, ib->get(), blocklength());
+#ifndef NDEBUG
+{
+record_type::accessor ra;
+record_.insert(ra, ib->sourcefile_);
+ra->second.push_back(ib->sourceindex_);
+}
+#endif
+            const u32 bc = ib->sourcefile_->BlockCount();
+            if (ib_needs_releasing)
+              release(ib);
+
+            const u32 idx = ++a->second.first;
+//printf("next_idx = %u\n", idx);
+            if (idx == bc) {
+              // there should be no buffers waiting to be hashed:
+              assert(a->second.second.size() == 0);
+              //assert(!a->second.second.find(ia, ib->sourceindex_));
+#ifndef NDEBUG
+              assert(shm_.erase(a));
+#else
+              (bool) shm_.erase(a);
+#endif
+              break;
+            } else if (a->second.second.find(ia, idx)) { // can any deferred buffers now be used up?
+//printf("found %u in deferred_list\n", idx);
+              ib = ia->second;
+              ib_needs_releasing = true;
+
+              a->second.second.erase(ia);
+            } else {
+//printf("did not find %u in deferred_list\n", idx);
+              break;
+            }
+          } // for
+        } else if (a->second.first < ib->sourceindex_) { // buffer cannot be used for hash yet - defer its use until correct time
+//printf("deferred (buffer %u)\n", ib->id_);
+#ifndef NDEBUG
+//if (a->second.second.find(ia, ib->sourceindex_)) printf("(%s %u) already in deferred_list\n", ib->sourcefile_->get_diskfilename().c_str(), ib->sourceindex_);
+#endif
+//assert(!a->second.second.find(ia, ib->sourceindex_) || ia->second == ib);
+          assert(!a->second.second.find(ia, ib->sourceindex_));
+
+          if (a->second.second.insert(ia, ib->sourceindex_)) {
+#ifndef NDEBUG
+//printf("inserted (%s %u) into deferred_list\n", ib->sourcefile_->get_diskfilename().c_str(), ib->sourceindex_);
+#endif
+            add_ref(*ib);
+            ia->second = ib;
+          }
+
+        } else {
+//printf("ignored\n");
+        }
+      }
+
+    class create_filter_read : public filter_read_base<create_filter_read, create_buffer> {
+    public:
+      create_filter_read(pipeline_state<create_buffer>& s) : filter_read_base<create_filter_read, create_buffer>(s) {}
+
+      void on_mutex_held(create_buffer* ib) {
+        create_pipeline_state& s = static_cast<create_pipeline_state&> (state_);
+
+        if (!s.deferhashcomputation_) return;
+
+        ib->sourcefile_ = *s.sourcefile_;
+        ib->sourceindex_ = s.sourceindex_;
+
+        if (s.sourcefile_ != s.sourcefiles_.end()) {
+          // Work out which source file the next block belongs to
+          if (++s.sourceindex_ >= (*s.sourcefile_)->BlockCount()) {
+            s.sourceindex_ = 0;
+            ++s.sourcefile_;
+          }
+        }
+      }
+
+      bool on_inputbuffer_read(create_buffer* /* ib */) {
+        // The last buffer for a sourcefile causes a 0 entry to be inserted into shm_ if
+        // try_to_update_hashes() is called more than once for same buffer. The easiest
+        // solution is to not call try_to_update_hashes() here.
+        //static_cast<create_pipeline_state&> (state_).try_to_update_hashes(ib);
+        return true;
+      }
+    };
+
+    class create_filter_process : public filter_process_base<create_filter_process, create_buffer, Par2Creator> {
+    public:
+      create_filter_process(Par2Creator& delegate, pipeline_state<create_buffer>& s) :
+        filter_process_base<create_filter_process, create_buffer, Par2Creator>(delegate, s) {}
+
+      virtual void* operator()(void* ib) {
+        // try_to_update_hashes() should be called first because if the superclass is first called, it will
+        // call ib->release() which will make ib invalid for the call to try_to_update_hashes():
+        static_cast<create_pipeline_state&> (state_).try_to_update_hashes(static_cast<create_buffer*> (ib));
+        return filter_process_base<create_filter_process, create_buffer, Par2Creator>::operator()(ib);
+      }
+    };
+
+  #endif
+#endif
+
 #ifdef _MSC_VER
 #ifdef _DEBUG
 #undef THIS_FILE
@@ -31,7 +222,10 @@ Par2Creator::Par2Creator(void)
 : noiselevel(CommandLine::nlUnknown)
 , blocksize(0)
 , chunksize(0)
-, inputbuffer(0)
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+#else
+//, inputbuffer(0)
+#endif
 , outputbuffer(0)
 
 , sourcefilecount(0)
@@ -47,7 +241,15 @@ Par2Creator::Par2Creator(void)
 , creatorpacket(0)
 
 , deferhashcomputation(false)
+
+#if WANT_CONCURRENT
+, concurrent_processing_level(ALL_CONCURRENT)
+, last_cout(tbb::tick_count::now())
+#endif
 {
+#if WANT_CONCURRENT
+  cout_in_use = 0;
+#endif
 }
 
 Par2Creator::~Par2Creator(void)
@@ -55,8 +257,17 @@ Par2Creator::~Par2Creator(void)
   delete mainpacket;
   delete creatorpacket;
 
-  delete [] (u8*)inputbuffer;
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE && GPGPU_CUDA
+  cuda::DeallocateResources();
+#endif
+
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+  if (outputbuffer)
+    tbb::cache_aligned_allocator<u8>().deallocate((u8*)outputbuffer, 0);
+#else
+//  delete [] (u8*)inputbuffer;
   delete [] (u8*)outputbuffer;
+#endif
 
   vector<Par2CreatorSourceFile*>::iterator sourcefile = sourcefiles.begin();
   while (sourcefile != sourcefiles.end())
@@ -83,6 +294,22 @@ Result Par2Creator::Process(const CommandLine &commandline)
   string basepath = commandline.GetBasePath();
   size_t memorylimit = commandline.GetMemoryLimit();
   largestfilesize = commandline.GetLargestSourceSize();
+
+#if WANT_CONCURRENT
+  concurrent_processing_level = commandline.GetConcurrentProcessingLevel();
+  if (noiselevel > CommandLine::nlQuiet) {
+    cout << "Processing ";
+    if (ALL_SERIAL == concurrent_processing_level)
+      cout << "checksums and Reed-Solomon data serially.";
+    else if (CHECKSUM_SERIALLY_BUT_PROCESS_CONCURRENTLY == concurrent_processing_level)
+      cout << "checksums serially and Reed-Solomon data concurrently.";
+    else if (ALL_CONCURRENT == concurrent_processing_level)
+      cout << "checksums and Reed-Solomon data concurrently.";
+    else
+      return eLogicError;
+    cout << endl;
+  }
+#endif
 
   // Compute block size from block count or vice versa depending on which was
   // specified on the command line
@@ -442,10 +669,164 @@ bool Par2Creator::ComputeRecoveryFileCount(void)
   return true;
 }
 
+#if WANT_CONCURRENT_PAR2_FILE_OPENING
+
+Par2CreatorSourceFile* Par2Creator::OpenSourceFile(const CommandLine::ExtraFile &extrafile, string basepath)
+{
+    std::auto_ptr<Par2CreatorSourceFile> sourcefile(new Par2CreatorSourceFile);
+
+    if (noiselevel > CommandLine::nlSilent) {
+      string  name;
+      DiskFile::SplitRelativeFilename(extrafile.FileName(), basepath, name);
+
+      tbb::mutex::scoped_lock l(cout_mutex);
+      if (noiselevel > CommandLine::nlSilent)
+        cout << "Opening: " << name << endl;
+    }
+
+    // Open the source file and compute its Hashes and CRCs.
+    if (!sourcefile->Open(noiselevel, extrafile, blocksize, deferhashcomputation, basepath, cout_mutex, last_cout)) {
+      string  name;
+      DiskFile::SplitRelativeFilename(extrafile.FileName(), basepath, name);
+
+      tbb::mutex::scoped_lock l(cout_mutex);
+      cerr << "error: could not open '" << name << "'" << endl;
+      return NULL;
+    }
+
+    // Record the file verification and file description packets
+    // in the critical packet list.
+    sourcefile->RecordCriticalPackets(criticalpackets);
+
+    // Add the source file to the sourcefiles array.
+    //sourcefiles.push_back(sourcefile);
+
+    // Close the source file until its needed
+    sourcefile->Close();
+
+    return sourcefile.release();
+}
+
+  #if 1
+
+  class pipeline_state_open_source_file {
+  public:
+    pipeline_state_open_source_file(const vector<CommandLine::ExtraFile>& files,
+      tbb::concurrent_vector<Par2CreatorSourceFile*>& res, Par2Creator& delegate, string basepath) :
+      files_(files), res_(res), delegate_(delegate), basepath_(basepath), ok_(true) { idx_ = 0; }
+
+    const vector<CommandLine::ExtraFile>&           files(void) const { return files_; }
+    string                                          basepath(void) const { return basepath_;}
+    tbb::concurrent_vector<Par2CreatorSourceFile*>& res(void) const { return res_; }
+    Par2Creator&                                    delegate(void) const { return delegate_; }
+    unsigned                                        add_idx(int delta) { return idx_ += delta; }
+
+    bool                                            is_ok(void) const { return ok_; }
+    void                                            set_not_ok(void) { ok_ = false; }
+
+  private:
+    const vector<CommandLine::ExtraFile>&           files_;
+    tbb::concurrent_vector<Par2CreatorSourceFile*>& res_;
+    Par2Creator&                                    delegate_;
+    tbb::atomic<unsigned>                           idx_;
+    string                                          basepath_;
+
+    bool                                            ok_; // if an error or failure occurs then this becomes false
+  };
+
+  class filter_open_source_file : public tbb::filter {
+  private:
+    filter_open_source_file& operator=(const filter_open_source_file&); // assignment disallowed
+  protected:
+    pipeline_state_open_source_file& state_;
+  public:
+    filter_open_source_file(pipeline_state_open_source_file& s) :
+      tbb::filter(false /* tbb::filter::parallel */), state_(s) {}
+    virtual void* operator()(void*);
+  };
+
+  //virtual
+  void* filter_open_source_file::operator()(void*) {
+    if (!state_.is_ok())
+        return NULL; // abort
+
+    unsigned idx = state_.add_idx(1) - 1;
+    const vector<CommandLine::ExtraFile>& files = state_.files();
+    if (idx >= files.size()) {
+      state_.add_idx(-1);
+      return NULL; // done
+    }
+
+    Par2CreatorSourceFile* sf = state_.delegate().OpenSourceFile(files[idx], state_.basepath());
+    if (!sf)
+      state_.set_not_ok();
+    else
+      state_.res().push_back(sf);
+
+    return this; // tell tbb::pipeline that there is more to process
+  }
+
+  #else
+
+  class ApplyOpenSourceFile {
+    Par2Creator* const _obj;
+    const std::vector<CommandLine::ExtraFile>& _extrafiles;
+    tbb::concurrent_vector<Par2CreatorSourceFile*>& _res;
+    tbb::atomic<u32>& _ok;
+  public:
+    void operator()( const tbb::blocked_range<size_t>& r ) const {
+      Par2Creator* obj = _obj;
+      const std::vector<CommandLine::ExtraFile>& extrafiles = _extrafiles;
+      tbb::concurrent_vector<Par2CreatorSourceFile*>& res = _res;
+      tbb::atomic<u32>& ok = _ok;
+      for ( size_t it = r.begin(); ok && it != r.end(); ++it ) {
+        Par2CreatorSourceFile* sf = obj->OpenSourceFile(extrafiles[it], basepath);
+        if (!sf) {
+          ok = false;
+          break;
+        } else
+          res.push_back(sf);
+      }
+    }
+
+    ApplyOpenSourceFile(Par2Creator* obj, const std::vector<CommandLine::ExtraFile>& v,
+      tbb::concurrent_vector<Par2CreatorSourceFile*>& res, tbb::atomic<u32>& ok) :
+      _obj(obj), _extrafiles(v), _res(res), _ok(ok) { _ok = true; }
+  };
+
+  #endif
+#endif
+
 // Open all of the source files, compute the Hashes and CRC values, and store
 // the results in the file verification and file description packets.
 bool Par2Creator::OpenSourceFiles(const list<CommandLine::ExtraFile> &extrafiles, string basepath)
 {
+#if WANT_CONCURRENT_PAR2_FILE_OPENING
+  if (ALL_CONCURRENT == concurrent_processing_level) {
+    std::vector<CommandLine::ExtraFile> v;
+    std::copy(extrafiles.begin(), extrafiles.end(), std::back_inserter(v));
+
+    tbb::concurrent_vector<Par2CreatorSourceFile*> res;
+  #if 1
+    pipeline_state_open_source_file                s(v, res, *this, basepath);
+    tbb::pipeline                                  p;
+    filter_open_source_file                        fosf(s);
+    p.add_filter(fosf);
+    p.run(tbb::task_scheduler_init::default_num_threads());
+    bool                                           ok = s.is_ok();
+  #else
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, v.size()), ::ApplyOpenSourceFile(this, v, res, ok));
+  #endif
+    if (!ok)
+      return false;
+    std::copy(res.begin(), res.end(), std::back_inserter(sourcefiles));
+  } else for (ExtraFileIterator extrafile = extrafiles.begin(); extrafile != extrafiles.end(); ++extrafile) {
+    Par2CreatorSourceFile* sourcefile = OpenSourceFile(*extrafile, basepath);
+    if (!sourcefile)
+      return false;
+    sourcefiles.push_back(sourcefile);
+  }
+#else
   ExtraFileIterator extrafile = extrafiles.begin();
   while (extrafile != extrafiles.end())
   {
@@ -476,6 +857,7 @@ bool Par2Creator::OpenSourceFiles(const list<CommandLine::ExtraFile> &extrafiles
 
     ++extrafile;
   }
+#endif
 
   return true;
 }
@@ -794,10 +1176,37 @@ bool Par2Creator::InitialiseOutputFiles(string par2filename)
 // Allocate memory buffers for reading and writing data to disk.
 bool Par2Creator::AllocateBuffers(void)
 {
-  inputbuffer = new u8[chunksize];
-  outputbuffer = new u8[chunksize * recoveryblockcount];
+#if GPGPU_CUDA
+  // allocate the GPU output buffers
+  if (rs.has_gpu() && 0 == cuda::AllocateResources(recoveryblockcount, (size_t) chunksize))
+    rs.set_has_gpu(false);
+#endif
 
-  if (inputbuffer == NULL || outputbuffer == NULL)
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+  typedef __TBB_TypeWithAlignmentAtLeastAsStrict(u8) element_type;
+  const size_t aligned_chunksize = (sizeof(u8)*(size_t)chunksize+sizeof(element_type)-1)/sizeof(element_type);
+  aligned_chunksize_ = aligned_chunksize;
+  size_t sz = aligned_chunksize * recoveryblockcount;
+  outputbuffer = tbb::cache_aligned_allocator<u8>().allocate(sz);//new u8[sz];
+#else
+  if (!inputbuffer.alloc(chunksize))
+  {
+    cerr << "Could not allocate buffer memory." << endl;
+    return false;
+  }
+//  inputbuffer = new u8[chunksize];
+  outputbuffer = new u8[chunksize * recoveryblockcount];
+#endif
+
+#if (WANT_CONCURRENT && CONCURRENT_PIPELINE) || DSTOUT
+  outputbuffer_element_state_.resize(recoveryblockcount);
+#endif
+
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+  if (outputbuffer == NULL)
+#else
+  if (/*inputbuffer == NULL ||*/ outputbuffer == NULL)
+#endif
   {
     cerr << "Could not allocate buffer memory." << endl;
     return false;
@@ -826,9 +1235,202 @@ bool Par2Creator::ComputeRSMatrix(void)
   return true;
 }
 
+#if WANT_CONCURRENT
+
+void* Par2Creator::OutputBufferAt(u32 outputindex) {
+  #if CONCURRENT_PIPELINE
+  // Select the appropriate part of the output buffer
+  return &((u8*)outputbuffer)[aligned_chunksize_ * outputindex];
+  #else
+  // Select the appropriate part of the output buffer
+  return &((u8*)outputbuffer)[chunksize * outputindex];
+  #endif
+}
+
+bool Par2Creator::ProcessDataForOutputIndex_(u32 outputblock, u32 outputendblock, size_t blocklength,
+                                             u32 inputblock, buffer& inputbuffer)
+{
+  #if CONCURRENT_PIPELINE
+    int val = (outputbuffer_element_state_[outputblock] -= 2); // 0 -> -2, 1 -> -1
+    if (val < -2) { // index is already in use: defer its processing
+      outputbuffer_element_state_[outputblock] += 2; // undo my changes
+//printf("deferring %u\n", outputblock);
+      return false;
+    }
+    assert(val == -2 || val == -1); // ie, hold lock
+
+    // Select the appropriate part of the output buffer
+    void *outbuf = OutputBufferAt(outputblock);//&((u8*)outputbuffer)[aligned_chunksize_ * outputblock];
+  #else
+    // Select the appropriate part of the output buffer
+    void *outbuf = OutputBufferAt(outputblock);//&((u8*)outputbuffer)[chunksize * outputblock];
+  #endif
+
+    // Process the data through the RS matrix
+    rs.Process(blocklength, inputblock, inputbuffer, outputblock, outbuf);
+
+  #if CONCURRENT_PIPELINE
+    assert(val < 0);
+    outputbuffer_element_state_[outputblock] += 2; // undo my changes, ie, release lock
+  #endif
+
+    if (noiselevel > CommandLine::nlQuiet) {
+      tbb::tick_count now = tbb::tick_count::now();
+      if ((now - last_cout).seconds() >= 0.1) { // only update every 0.1 seconds
+// when building with -O3 under Darwin, using u32 instead of u64 causes incorrect values to be printed :-(
+// I believe it's a compiler codegen bug, but this work-around (using u64 instead of u32) is "good enough".
+        // Update a progress indicator
+        u64 oldfraction = (u64)(1000 * progress / totaldata);
+        progress += blocklength;
+        u64 newfraction = (u64)(1000 * progress / totaldata);
+
+        if (oldfraction != newfraction) {
+//        tbb::mutex::scoped_lock l(cout_mutex);
+          if (0 == cout_in_use.compare_and_swap(outputendblock, 0)) { // <= this version doesn't block - only need 1 thread to write to cout
+            last_cout = now;
+#ifndef NDEBUG
+//            cout << "GPU=" << cuda::GetProcessingCount() << " - " << "Processing: " << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
+#else
+            cout << "Processing: " << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
+#endif
+            cout_in_use = 0;
+          }
+        }
+      } else
+        progress += blocklength;
+    }
+    return true;
+}
+
+void Par2Creator::ProcessDataForOutputIndex(u32 outputblock, u32 outputendblock, size_t blocklength,
+                                            u32 inputblock, buffer& inputbuffer)
+{
+  std::vector<u32> v; // which indexes need deferred processing
+  v.reserve(outputendblock - outputblock);
+
+  for( ; outputblock != outputendblock; ++outputblock )
+    if (!ProcessDataForOutputIndex_(outputblock, outputendblock, blocklength, inputblock, inputbuffer))
+      v.push_back(outputblock);
+
+  // try to process all deferred indexes
+  std::vector<u32> d;
+  do {
+    for (std::vector<u32>::const_iterator vit = v.begin(); vit != v.end(); ++vit) { // which indexes need deferred processing
+      const u32 oi = *vit;
+//printf("trying to process deferred %u\n", oi);
+      if (!ProcessDataForOutputIndex_(oi, outputendblock, blocklength, inputblock, inputbuffer)) {
+        d.push_back(oi); // failed -> try again
+      }
+    }
+    v = d; d.clear();
+  } while (!v.empty());
+}
+
+class ApplyPar2CreatorRSProcess {
+public:
+  ApplyPar2CreatorRSProcess(Par2Creator* obj, size_t blocklength, u32 inputblock, buffer& inputbuffer) :
+    _obj(obj), _blocklength(blocklength), _inputblock(inputblock), _inputbuffer(inputbuffer) {}
+  void operator()(const tbb::blocked_range<u32>& r) const {
+    _obj->ProcessDataForOutputIndex(r.begin(), r.end(), _blocklength, _inputblock, _inputbuffer);
+  }
+private:
+  Par2Creator* _obj;
+  size_t       _blocklength;
+  u32          _inputblock;
+  buffer&      _inputbuffer;
+};
+
+void Par2Creator::ProcessDataConcurrently(size_t blocklength, u32 inputblock, buffer& inputbuffer)
+{
+  if (ALL_SERIAL != concurrent_processing_level) {
+    static tbb::affinity_partitioner ap;
+    tbb::parallel_for(tbb::blocked_range<u32>(0, recoveryblockcount),
+      ::ApplyPar2CreatorRSProcess(this, blocklength, inputblock, inputbuffer), ap);
+  } else
+    ProcessDataForOutputIndex(0, recoveryblockcount, blocklength, inputblock, inputbuffer);
+}
+
+#endif
+
 // Read source data, process it through the RS matrix and write it to disk.
 bool Par2Creator::ProcessData(u64 blockoffset, size_t blocklength)
 {
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+  // Clear the output buffer
+  memset(outputbuffer, 0, aligned_chunksize_ * recoveryblockcount);
+
+  for (size_t i = 0; i != recoveryblockcount; ++i) {
+    // when outputbuffer_element_state_ contains tbb::atomic<> objects,
+    // they must be manually initialized to zero:
+    outputbuffer_element_state_[i] = 0;
+  }
+
+//cout << "Creating using async I/O." << endl;
+    assert(sourceblocks.size() == sourceblockcount);
+    vector<DataBlock*>         sourceblocks_;
+    sourceblocks_.resize(sourceblockcount);
+    for (size_t i = 0; i != sourceblockcount; ++i)
+      sourceblocks_[i] = &sourceblocks[i];
+
+    const size_t max_tokens = ALL_SERIAL == concurrent_processing_level ? 1 : tbb::task_scheduler_init::default_num_threads();
+    create_pipeline_state s(max_tokens, chunksize, recoveryblockcount, blocklength, blockoffset,
+                            sourceblocks_, sourcefiles, deferhashcomputation);
+
+    tbb::pipeline p;
+    create_filter_read cfr(s);
+    p.add_filter(cfr);
+    create_filter_process cfp(*this, s);
+    p.add_filter(cfp);
+    //create_filter_write cfw(*this, s);
+    //p.add_filter(cfw);
+
+    p.run(max_tokens);
+
+  #if GPGPU_CUDA
+    if (rs.has_gpu()) {
+    #ifndef NDEBUG
+      CTimeInterval gpp("GPU postprocessing");
+    #endif
+
+      // do xor's of outputbuffers that are on the video card
+      create_buffer* buf = s.first_available_buffer();
+      if (!buf) {
+        cerr << "Failed to acquire a buffer for copying back data from video card. Creation failed." << endl;
+        return false;
+      }
+
+      const u32 n = cuda::GetDeviceOutputBufferCount();
+      for (u32 i = 0; i != n; ++i) {
+        if (!cuda::CopyDeviceOutputBuffer(i, (u32*) buf->get())) {
+          cerr << "Failed to copy back data from video card. Creation failed." << endl;
+          return false;
+        }
+        cuda::Xor((u32*) OutputBufferAt(i), (const u32*) buf->get(), (size_t) chunksize);
+      }
+      s.release(buf);
+
+    #ifndef NDEBUG
+      gpp.emit();
+    #endif
+
+      const unsigned pc = cuda::GetProcessingCount();
+      if (0 == pc)
+        cout << "The GPU was not used for processing." << endl;
+      else {
+        u64 fraction = (1000 * (u64) pc) / ((u64) sourceblockcount * (u64) recoveryblockcount);
+        cout << "The GPU was used for " << fraction/10 << '.' << fraction%10 << "% of the processing (" <<
+          pc << " out of " << ((u64) sourceblockcount * (u64) recoveryblockcount) << " processing blocks)." << endl;
+      }
+    }
+  #endif
+
+    p.clear();
+
+    if (!s.is_ok()) {
+      cerr << "Creation of recovery file(s) has failed." << endl;
+      return false;
+    }
+#else
   // Clear the output buffer
   memset(outputbuffer, 0, chunksize * recoveryblockcount);
 
@@ -865,8 +1467,9 @@ bool Par2Creator::ProcessData(u64 blockoffset, size_t blocklength)
       }
     }
 
+  {
     // Read data from the current input block
-    if (!sourceblock->ReadData(blockoffset, blocklength, inputbuffer))
+    if (!sourceblock->ReadData(blockoffset, blocklength, inputbuffer.get()))
       return false;
 
     if (deferhashcomputation)
@@ -874,9 +1477,12 @@ bool Par2Creator::ProcessData(u64 blockoffset, size_t blocklength)
       assert(blockoffset == 0 && blocklength == blocksize);
       assert(sourcefile != sourcefiles.end());
 
-      (*sourcefile)->UpdateHashes(sourceindex, inputbuffer, blocklength);
+      (*sourcefile)->UpdateHashes(sourceindex, inputbuffer.get(), blocklength);
     }
 
+  #if WANT_CONCURRENT
+      ProcessDataConcurrently(blocklength, inputblock, inputbuffer);
+  #else
     // For each output block
     for (u32 outputblock=0; outputblock<recoveryblockcount; outputblock++)
     {
@@ -898,6 +1504,8 @@ bool Par2Creator::ProcessData(u64 blockoffset, size_t blocklength)
           cout << "Processing: " << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
         }
       }
+     }
+  #endif
     }
 
     // Work out which source file the next block belongs to
@@ -913,15 +1521,20 @@ bool Par2Creator::ProcessData(u64 blockoffset, size_t blocklength)
   {
     lastopenfile->Close();
   }
-
+#endif
   if (noiselevel > CommandLine::nlQuiet)
     cout << "Writing recovery packets\r";
 
   // For each output block
   for (u32 outputblock=0; outputblock<recoveryblockcount;outputblock++)
   {
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+    // Select the appropriate part of the output buffer
+    char *outbuf = &((char*)outputbuffer)[aligned_chunksize_ * outputblock];
+#else
     // Select the appropriate part of the output buffer
     char *outbuf = &((char*)outputbuffer)[chunksize * outputblock];
+#endif
 
     // Write the data to the recovery packet
     if (!recoverypackets[outputblock].WriteData(blockoffset, blocklength, outbuf))

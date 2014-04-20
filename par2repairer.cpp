@@ -19,6 +19,98 @@
 
 #include "par2cmdline.h"
 
+#if WANT_CONCURRENT
+  #include  <set>
+
+  #if CONCURRENT_PIPELINE
+    class repair_buffer : public pipeline_buffer {
+      friend class repair_filter_read;
+      vector<DataBlock*>::iterator copyblock_;
+      bool                         copyblock_not_at_end_;
+    };
+
+    class repair_pipeline_state : public pipeline_state<repair_buffer> {
+    private:
+      friend class repair_filter_read;
+      vector<DataBlock*>&                          copyblocks_;
+      vector<DataBlock*>::iterator                 copyblock_;
+    public:
+      repair_pipeline_state(
+        size_t                                     max_tokens,
+        u64                                        chunksize,
+        u32                                        missingblockcount,
+        size_t                                     blocklength,
+        u64                                        blockoffset,
+        vector<DataBlock*>&                        inputblocks,
+        vector<DataBlock*>&                        copyblocks) :
+        pipeline_state<repair_buffer>(max_tokens, chunksize, missingblockcount, blocklength, blockoffset, inputblocks),
+        copyblocks_(copyblocks), copyblock_(copyblocks.begin()) {}
+    };
+
+    class repair_filter_read : public filter_read_base<repair_filter_read, repair_buffer> {
+    public:
+      repair_filter_read(repair_pipeline_state& s) : filter_read_base<repair_filter_read, repair_buffer>(s) {}
+
+      void on_mutex_held(repair_buffer* ib) {
+        repair_pipeline_state& s = static_cast<repair_pipeline_state&> (state_);
+        ib->copyblock_ = s.copyblock_; //copyblock_ = s.copyblock_;
+        ib->copyblock_not_at_end_ = s.copyblock_ != s.copyblocks_.end(); //copyblock_not_at_end_ = copyblock_ != s.copyblocks_.end();
+        if (ib->copyblock_not_at_end_)
+          ++s.copyblock_;
+      }
+
+      bool on_inputbuffer_read(repair_buffer* ib) {
+        // Have we reached the last source data block
+        if (ib->copyblock_not_at_end_) {
+          // Does this block need to be copied to the target file
+          if ((*ib->copyblock_)->IsSet()) {
+//DiskFile* df = (*copyblock)->GetDiskFile();
+//printf("%p: start async write to %s\n", pthread_self(), df->FileName().c_str());
+            // Write the block back to disk in the new target file
+//printf("filter_read::operator()\n");
+            assert(pipeline_buffer::NONE == ib->get_write_status());
+
+#ifdef DEBUG_ASYNC_WRITE
+// used to debug the problem where the last byte of the file was not being written to - the bug fix is
+// in diskfile.cpp: DiskFile::Create()
+printf("writing off=%llu len=%lu\n", (*ib->copyblock_)->GetOffset() + state_.blockoffset(), state_.blocklength());
+if (102388 == (*ib->copyblock_)->GetOffset()) {
+  for (unsigned i = 0; i != state_.blocklength(); ++i)
+    printf("%02x ", ((const unsigned char*) ib->get())[i]);
+  printf("\n");
+}
+#endif
+            size_t wrote;
+#if 0
+// used to debug the problem where the last byte of the file was not being written to - the bug fix is
+// in diskfile.cpp: DiskFile::Create()
+            if (!(*ib->copyblock_)->WriteData(state_.blockoffset(), state_.blocklength(), ib->get(), wrote))
+              return false;
+#else
+            if (!(*ib->copyblock_)->WriteDataAsync(ib->get_aiocb(), state_.blockoffset(),
+                                                   state_.blocklength(), ib->get(), wrote)) {
+              return false;
+            }
+
+            ib->set_write_status(pipeline_buffer::ASYNC_WRITE);
+#endif
+            state_.add_to_totalwritten(wrote);
+          }
+          //++copyblock;
+        }
+        return true;
+      }
+    };
+
+    class repair_filter_process : public filter_process_base<repair_filter_process, repair_buffer, Par2Repairer> {
+    public:
+      repair_filter_process(Par2Repairer& delegate, pipeline_state<repair_buffer>& s) :
+        filter_process_base<repair_filter_process, repair_buffer, Par2Repairer>(delegate, s) {}
+    };
+
+  #endif
+#endif
+
 #ifdef _MSC_VER
 #ifdef _DEBUG
 #undef THIS_FILE
@@ -46,18 +138,40 @@ Par2Repairer::Par2Repairer(void)
   damagedfilecount = 0;
   missingfilecount = 0;
 
-  inputbuffer = 0;
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+#else
+//inputbuffer = 0;
+#endif
   outputbuffer = 0;
 
   noiselevel = CommandLine::nlNormal;
+
+#if WANT_CONCURRENT
+  concurrent_processing_level = ALL_CONCURRENT;
+  cout_in_use = 0;
+  last_cout = tbb::tick_count::now();
+#endif
 }
 
 Par2Repairer::~Par2Repairer(void)
 {
-  delete [] (u8*)inputbuffer;
-  delete [] (u8*)outputbuffer;
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE && GPGPU_CUDA
+  cuda::DeallocateResources();
+#endif
 
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+  if (outputbuffer)
+    tbb::cache_aligned_allocator<u8>().deallocate((u8*)outputbuffer, 0);
+#else
+//delete [] (u8*)inputbuffer;
+  delete [] (u8*)outputbuffer;
+#endif
+
+#if WANT_CONCURRENT
+  tbb::concurrent_hash_map<u32, RecoveryPacket*, u32_hasher>::iterator rp = recoverypacketmap.begin();
+#else
   map<u32,RecoveryPacket*>::iterator rp = recoverypacketmap.begin();
+#endif
   while (rp != recoverypacketmap.end())
   {
     delete (*rp).second;
@@ -82,6 +196,22 @@ Result Par2Repairer::Process(const CommandLine &commandline, bool dorepair)
 {
   // What noiselevel are we using
   noiselevel = commandline.GetNoiseLevel();
+
+#if WANT_CONCURRENT
+  concurrent_processing_level = commandline.GetConcurrentProcessingLevel();
+  if (noiselevel > CommandLine::nlQuiet) {
+    cout << "Processing ";
+    if (ALL_SERIAL == concurrent_processing_level)
+      cout << "verifications and repairs serially.";
+    else if (CHECKSUM_SERIALLY_BUT_PROCESS_CONCURRENTLY == concurrent_processing_level)
+      cout << "verifications serially and repairs concurrently.";
+    else if (ALL_CONCURRENT == concurrent_processing_level)
+      cout << "verifications and repairs concurrently.";
+    else
+      return eLogicError;
+    cout << endl;
+  }
+#endif
 
   // do we want to purge par files on success ?
   bool purgefiles = commandline.GetPurgeFiles();
@@ -292,6 +422,9 @@ bool Par2Repairer::LoadPacketsFromFile(string filename)
     string path;
     string name;
     DiskFile::SplitFilename(filename, path, name);
+#if WANT_CONCURRENT
+    tbb::mutex::scoped_lock l(cout_mutex);
+#endif
     cout << "Loading \"" << name << "\"." << endl;
   }
 
@@ -323,14 +456,25 @@ bool Par2Repairer::LoadPacketsFromFile(string filename)
     {
       if (noiselevel > CommandLine::nlQuiet)
       {
+#if WANT_CONCURRENT
+        tbb::tick_count now = tbb::tick_count::now();
+        if ((now - last_cout).seconds() >= 0.1) { // only update every 0.1 seconds
+#endif
         // Update a progress indicator
         u32 oldfraction = (u32)(1000 * progress / filesize);
         u32 newfraction = (u32)(1000 * offset / filesize);
         if (oldfraction != newfraction)
         {
+#if WANT_CONCURRENT
+            last_cout = now;
+            tbb::mutex::scoped_lock l(cout_mutex);
+#endif
           cout << "Loading: " << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
           progress = offset;
         }
+#if WANT_CONCURRENT
+        }
+#endif
       }
 
       // Attempt to read the next packet header
@@ -492,6 +636,9 @@ bool Par2Repairer::LoadPacketsFromFile(string filename)
   {
     if (noiselevel > CommandLine::nlQuiet)
     {
+#if WANT_CONCURRENT
+      tbb::mutex::scoped_lock l(cout_mutex);
+#endif
       cout << "Loaded " << packets << " new packets";
       if (recoverypackets > 0) cout << " including " << recoverypackets << " recovery blocks";
       cout << endl;
@@ -504,7 +651,12 @@ bool Par2Repairer::LoadPacketsFromFile(string filename)
   else
   {
     if (noiselevel > CommandLine::nlQuiet)
+    {
+#if WANT_CONCURRENT
+      tbb::mutex::scoped_lock l(cout_mutex);
+#endif
       cout << "No new packets found" << endl;
+    }
     delete diskfile;
   }
   
@@ -527,6 +679,13 @@ bool Par2Repairer::LoadRecoveryPacket(DiskFile *diskfile, u64 offset, PACKET_HEA
   u32 exponent = packet->Exponent();
 
   // Try to insert the new packet into the recovery packet map
+#if WANT_CONCURRENT
+  {
+    tbb::concurrent_hash_map<u32, RecoveryPacket*, u32_hasher>::accessor a;
+    (bool) recoverypacketmap.insert(a, exponent); // returns whether exponent is new, and NOT whether insert succeeded
+    a->second = packet;
+  }
+#else
   pair<map<u32,RecoveryPacket*>::const_iterator, bool> location = recoverypacketmap.insert(pair<u32,RecoveryPacket*>(exponent, packet));
 
   // Did the insert fail
@@ -536,6 +695,7 @@ bool Par2Repairer::LoadRecoveryPacket(DiskFile *diskfile, u64 offset, PACKET_HEA
     delete packet;
     return false;
   }
+#endif
 
   return true;
 }
@@ -653,7 +813,15 @@ bool Par2Repairer::LoadMainPacket(DiskFile *diskfile, u64 offset, PACKET_HEADER 
     return false;
   }
 
+#if WANT_CONCURRENT
+  mainpacket.compare_and_swap(packet, NULL);
+  if (mainpacket != packet) {
+    delete packet;
+    return false;
+  }
+#else
   mainpacket = packet;
+#endif
 
   return true;
 }
@@ -674,10 +842,92 @@ bool Par2Repairer::LoadCreatorPacket(DiskFile *diskfile, u64 offset, PACKET_HEAD
     return false;
   }
 
+#if WANT_CONCURRENT
+  creatorpacket.compare_and_swap(packet, NULL);
+  if (creatorpacket != packet) {
+    delete packet;
+    return false;
+  }
+#else
   creatorpacket = packet;
+#endif
 
   return true;
 }
+
+#if WANT_CONCURRENT
+  #if defined(WIN32) || defined(__APPLE_CC__)
+  struct less_istring {
+    bool operator()( const std::string& x, const std::string& y ) const
+    { return stricmp(x.c_str(), y.c_str()) < 0; }
+  };
+  typedef less_istring less_string_type;
+  #else
+  typedef std::less<string> less_string_type;
+  #endif
+
+  #if 1
+
+  class pipeline_state_load_par2_packets {
+  public:
+    pipeline_state_load_par2_packets(const vector<string>& files, Par2Repairer& delegate) :
+      files_(files), delegate_(delegate) { idx_ = 0; }
+
+    const vector<string>& files(void) const { return files_; }
+    Par2Repairer&         delegate(void) const { return delegate_; }
+    unsigned              add_idx(int delta) { return idx_ += delta; }
+
+  private:
+    const vector<string>& files_;
+    Par2Repairer&         delegate_;
+    tbb::atomic<unsigned> idx_;
+  };
+
+  class filter_load_par2_packets : public tbb::filter {
+  private:
+    filter_load_par2_packets& operator=(const filter_load_par2_packets&); // assignment disallowed
+  protected:
+    pipeline_state_load_par2_packets& state_;
+  public:
+    filter_load_par2_packets(pipeline_state_load_par2_packets& s) :
+      tbb::filter(false /* tbb::filter::parallel */), state_(s) {}
+    virtual void* operator()(void*);
+  };
+
+  //virtual
+  void* filter_load_par2_packets::operator()(void*) {
+    unsigned idx = state_.add_idx(1) - 1;
+    const vector<string>& files = state_.files();
+    if (idx >= files.size()) {
+      state_.add_idx(-1);
+      return NULL; // done
+    }
+
+    state_.delegate().LoadPacketsFromFile(files[idx]);
+
+    return this; // tell tbb::pipeline that there is more to process
+  }
+
+  #else
+
+  class ApplyLoadPacketsFromFile {
+    Par2Repairer* const _obj;
+    const std::vector<string>& _v;
+  public:
+    void operator()( const tbb::blocked_range<size_t>& r ) const {
+      Par2Repairer* obj = _obj;
+      const std::vector<string>& v = _v;
+      for ( size_t i = r.begin(); i != r.end(); ++i )
+        (bool) obj->LoadPacketsFromFile(v[i]);
+    }
+
+    ApplyLoadPacketsFromFile( Par2Repairer* obj, const std::vector<string>& v ) :
+      _obj(obj), _v(v) {}
+  };
+
+  #endif
+
+#endif
 
 // Load packets from other PAR2 files with names based on the original PAR2 file
 bool Par2Repairer::LoadPacketsFromOtherFiles(string filename)
@@ -748,7 +998,38 @@ bool Par2Repairer::LoadPacketsFromOtherFiles(string filename)
   }
 
   // Find files called "*.par2" or "name.*.par2"
+#if WANT_CONCURRENT_PAR2_FILE_OPENING
+  std::set<string, less_string_type> allfiles;
+  {
+    string wildcard = name.empty() ? "*.par2" : name + ".*.par2";
+    std::auto_ptr< list<string> >  files(DiskFile::FindFiles(path, wildcard, false));
+    std::copy(files->begin(), files->end(), std::inserter(allfiles, allfiles.begin()));
+  }
 
+  {
+    string wildcard = name.empty() ? "*.PAR2" : name + ".*.PAR2";
+    std::auto_ptr< list<string> >  files(DiskFile::FindFiles(path, wildcard, false));
+    std::copy(files->begin(), files->end(), std::inserter(allfiles, allfiles.begin()));
+  }
+
+  if (ALL_CONCURRENT == concurrent_processing_level) {
+    std::vector<string> v;
+    v.reserve(allfiles.size());
+    std::copy(allfiles.begin(), allfiles.end(), std::back_inserter(v));
+  #if 1
+    pipeline_state_load_par2_packets s(v, *this);
+    tbb::pipeline                    p;
+    filter_load_par2_packets         flpp(s);
+    p.add_filter(flpp);
+    p.run(tbb::task_scheduler_init::default_num_threads());
+  #else
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, v.size(), 1),
+      ::ApplyLoadPacketsFromFile(this, v));
+  #endif
+  } else for (std::set<string, less_string_type>::iterator it = allfiles.begin();
+            it != allfiles.end(); ++it)
+    LoadPacketsFromFile(*it);
+#else
   {
     string wildcard = name.empty() ? "*.par2" : name + ".*.par2";
     list<string> *files = DiskFile::FindFiles(path, wildcard, false);
@@ -766,6 +1047,7 @@ bool Par2Repairer::LoadPacketsFromOtherFiles(string filename)
       LoadPacketsFromFile(*s);
     }
   }
+#endif
 
   return true;
 }
@@ -807,7 +1089,11 @@ bool Par2Repairer::CheckPacketConsistency(void)
   // Check that the recovery blocks have the correct amount of data
   // and discard any that don't
   {
+#if WANT_CONCURRENT
+    tbb::concurrent_hash_map<u32, RecoveryPacket*, u32_hasher>::iterator rp = recoverypacketmap.begin();
+#else
     map<u32,RecoveryPacket*>::iterator rp = recoverypacketmap.begin();
+#endif
     while (rp != recoverypacketmap.end())
     {
       if (rp->second->BlockSize() == blocksize)
@@ -819,8 +1105,13 @@ bool Par2Repairer::CheckPacketConsistency(void)
         cerr << "Incorrect sized recovery block for exponent " << rp->second->Exponent() << " discarded" << endl;
 
         delete rp->second;
+#if WANT_CONCURRENT
+        if (recoverypacketmap.erase((*rp).first))
+          rp = recoverypacketmap.begin();  // start again from beginning
+#else
         map<u32,RecoveryPacket*>::iterator x = rp++;
         recoverypacketmap.erase(x);
+#endif
       }
     }
   }
@@ -1082,6 +1373,200 @@ static bool SortSourceFilesByFileName(Par2RepairerSourceFile *low,
   return low->TargetFileName() < high->TargetFileName();
 }
 
+#if WANT_CONCURRENT_SOURCE_VERIFICATION
+
+void Par2Repairer::VerifyOneSourceFile(Par2RepairerSourceFile *sourcefile, string basepath, bool& finalresult)
+{
+  if (sourcefile) {
+    // What filename does the file use
+    string filename = sourcefile->TargetFileName();
+
+    // Check to see if we have already used this file
+    if (diskFileMap.Find(filename) != 0)
+    {
+      // The file has already been used!
+
+      cerr << "Source file " << filename/*filenumber+1*/ << " is a duplicate." << endl;
+
+      finalresult = false;
+      return;
+    }
+
+    DiskFile *diskfile = new DiskFile;
+
+    // Does the target file exist
+    if (diskfile->Open(filename))
+    {
+      // Yes. Record that fact.
+      sourcefile->SetTargetExists(true);
+
+      // Remember that the DiskFile is the target file
+      sourcefile->SetTargetFile(diskfile);
+
+      // Remember that we have processed this file
+      bool success = diskFileMap.Insert(diskfile);
+      assert(success);
+
+      // Do the actual verification
+      if (!VerifyDataFile(diskfile, sourcefile, basepath))
+        finalresult = false;
+
+      // We have finished with the file for now
+      diskfile->Close();
+
+      // Find out how much data we have found
+      //UpdateVerificationResults(); removed to get better concurrency (caller will call it anyway)
+    }
+    else
+    {
+      // The file does not exist.
+      delete diskfile;
+
+      if (noiselevel > CommandLine::nlSilent) {
+        string  name;
+        DiskFile::SplitRelativeFilename(filename, basepath, name);
+
+        tbb::mutex::scoped_lock l(cout_mutex);
+        cout << "Target: \"" << name << "\" - missing." << endl;
+      }
+    }
+  }
+}
+
+void Par2Repairer::VerifyOneTargetFile(Par2RepairerSourceFile *sourcefile, string basepath, bool& finalresult)
+{
+  if (sourcefile) {
+    DiskFile *targetfile = sourcefile->GetTargetFile();
+
+    // Close the file
+    if (targetfile->IsOpen())
+      targetfile->Close();
+
+    // Mark all data blocks for the file as unknown
+    vector<DataBlock>::iterator sb = sourcefile->SourceBlocks();
+    for (u32 blocknumber=0; blocknumber<sourcefile->BlockCount(); blocknumber++)
+    {
+      sb->ClearLocation();
+      ++sb;
+    }
+
+    // Say we don't have a complete version of the file
+    sourcefile->SetCompleteFile(0);
+
+    // Re-open the target file
+    if (!targetfile->Open())
+    {
+      finalresult = false;
+      return;
+    }
+
+    // Verify the file again
+    if (!VerifyDataFile(targetfile, sourcefile, basepath))
+      finalresult = false;
+
+    // Close the file again
+    targetfile->Close();
+
+    // Find out how much data we have found
+    UpdateVerificationResults();
+  }
+}
+
+  #if 1
+
+  class pipeline_state_verify_source_file {
+  public:
+    pipeline_state_verify_source_file(const vector<Par2RepairerSourceFile*>& files, bool& finalresult, Par2Repairer& delegate, string basepath) :
+      files_(files), finalresult_(finalresult), delegate_(delegate), basepath_(basepath) { idx_ = 0; }
+
+    const vector<Par2RepairerSourceFile*>& files(void) const { return files_; }
+    string                                 basepath(void) const { return basepath_; }
+    Par2Repairer&                          delegate(void) const { return delegate_; }
+    unsigned                               add_idx(int delta) { return idx_ += delta; }
+
+    bool&                                  finalresult(void) const { return finalresult_; }
+
+  private:
+    const vector<Par2RepairerSourceFile*>& files_;
+    bool&                                  finalresult_;
+    Par2Repairer&                          delegate_;
+    string                                 basepath_;
+    tbb::atomic<unsigned>                  idx_;
+  };
+
+  class filter_verify_source_file : public tbb::filter {
+  private:
+    filter_verify_source_file& operator=(const filter_verify_source_file&); // assignment disallowed
+  protected:
+    pipeline_state_verify_source_file& state_;
+  public:
+    filter_verify_source_file(pipeline_state_verify_source_file& s) :
+      tbb::filter(false /* tbb::filter::parallel */), state_(s) {}
+    virtual void* operator()(void*);
+  };
+
+  //virtual
+  void* filter_verify_source_file::operator()(void*) {
+    unsigned idx = state_.add_idx(1) - 1;
+    const vector<Par2RepairerSourceFile*>& files = state_.files();
+    if (idx >= files.size()) {
+      state_.add_idx(-1);
+      return NULL; // done
+    }
+
+    state_.delegate().VerifyOneSourceFile(files[idx], state_.basepath(), state_.finalresult());
+
+    return this; // tell tbb::pipeline that there is more to process
+  }
+  
+  class filter_verify_target_file : public tbb::filter {
+  private:
+    filter_verify_target_file& operator=(const filter_verify_target_file&); // assignment disallowed
+  protected:
+    pipeline_state_verify_source_file& state_;
+  public:
+    filter_verify_target_file(pipeline_state_verify_source_file& s) :
+      tbb::filter(false /* tbb::filter::parallel */), state_(s) {}
+    virtual void* operator()(void*);
+  };
+
+  //virtual
+  void* filter_verify_target_file::operator()(void*) {
+    unsigned idx = state_.add_idx(1) - 1;
+    const vector<Par2RepairerSourceFile*>& files = state_.files();
+    if (idx >= files.size()) {
+      state_.add_idx(-1);
+      return NULL; // done
+    }
+
+    state_.delegate().VerifyOneTargetFile(files[idx], state_.basepath(), state_.finalresult());
+
+    return this; // tell tbb::pipeline that there is more to process
+  }
+
+  #else
+
+template <typename CONTAINER>
+class ApplyVerifyOneSourceFile {
+    Par2Repairer* const _obj;
+    const CONTAINER&    _files;
+    bool&               _finalresult;
+  public:
+    void operator()( const tbb::blocked_range<size_t>& r ) const {
+      Par2Repairer* obj = _obj;
+      const CONTAINER& files = _files;
+      for ( size_t i = r.begin(); i != r.end(); ++i )
+        obj->VerifyOneSourceFile(files[i], _finalresult);
+    }
+
+    ApplyVerifyOneSourceFile( Par2Repairer* obj, const CONTAINER& files, bool& finalresult) :
+      _obj(obj), _files(files), _finalresult(finalresult) {}
+};
+
+  #endif
+
+#endif
+
 // Attempt to verify all of the source files
 bool Par2Repairer::VerifySourceFiles(string basepath)
 {
@@ -1121,7 +1606,21 @@ bool Par2Repairer::VerifySourceFiles(string basepath)
   }
 
   sort(sortedfiles.begin(), sortedfiles.end(), SortSourceFilesByFileName);
-
+#if WANT_CONCURRENT_SOURCE_VERIFICATION
+  if (ALL_CONCURRENT == concurrent_processing_level) {
+  #if 1
+    pipeline_state_verify_source_file s(sortedfiles, finalresult, *this, basepath);
+    tbb::pipeline                     p;
+    filter_verify_source_file         fvsf(s);
+    p.add_filter(fvsf);
+    p.run(tbb::task_scheduler_init::default_num_threads());
+  #else
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, sortedfiles.size(), 1),
+      ::ApplyVerifyOneSourceFile< vector<Par2RepairerSourceFile*> >(this, sortedfiles, finalresult));
+  #endif
+  } else for (vector<Par2RepairerSourceFile*>::const_iterator it = sortedfiles.begin(); it != sortedfiles.end(); ++it)
+    VerifyOneSourceFile(*it, basepath, finalresult);
+#else
   // Start verifying the files
   sf = sortedfiles.begin();
   while (sf != sortedfiles.end())
@@ -1186,7 +1685,7 @@ bool Par2Repairer::VerifySourceFiles(string basepath)
 
     ++sf;
   }
-
+#endif
   return finalresult;
 }
 
@@ -1482,13 +1981,25 @@ bool Par2Repairer::ScanDataFile(DiskFile                *diskfile,    // [in]
   {
     if (noiselevel > CommandLine::nlQuiet)
     {
+#if WANT_CONCURRENT
+      tbb::tick_count now = tbb::tick_count::now();
+      if ((now - last_cout).seconds() >= 0.1) { // only update every 0.1 seconds
+#endif
       // Update a progress indicator
       u32 oldfraction = (u32)(1000 * progress / diskfile->FileSize());
       u32 newfraction = (u32)(1000 * (progress = filechecksummer.Offset()) / diskfile->FileSize());
       if (oldfraction != newfraction)
       {
+#if WANT_CONCURRENT
+          last_cout = now;
+          tbb::mutex::scoped_lock l(cout_mutex);
+#endif
         cout << "Scanning: \"" << shortname << "\": " << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
-      }
+       }
+#if WANT_CONCURRENT
+      } else
+        progress = filechecksummer.Offset();
+#endif
     }
 
     // If we fail to find a match, it might be because it was a duplicate of a block
@@ -1595,6 +2106,10 @@ bool Par2Repairer::ScanDataFile(DiskFile                *diskfile,    // [in]
 
       if (noiselevel > CommandLine::nlSilent)
       {
+#if WANT_CONCURRENT
+        tbb::mutex::scoped_lock l(cout_mutex);
+#endif
+
         // Did we find data from multiple target files
         if (multipletargets)
         {
@@ -1672,6 +2187,10 @@ bool Par2Repairer::ScanDataFile(DiskFile                *diskfile,    // [in]
     {
       if (noiselevel > CommandLine::nlSilent)
       {
+#if WANT_CONCURRENT
+        tbb::mutex::scoped_lock l(cout_mutex);
+#endif
+
         // Did we match the target file
         if (originalsourcefile == sourcefile)
         {
@@ -1711,6 +2230,9 @@ bool Par2Repairer::ScanDataFile(DiskFile                *diskfile,    // [in]
 
     if (noiselevel > CommandLine::nlSilent)
     {
+#if WANT_CONCURRENT
+        tbb::mutex::scoped_lock l(cout_mutex);
+#endif
       // We found not data, but did the file actually contain blocks we
       // had already found in other files.
       if (duplicatecount > 0)
@@ -1972,7 +2494,11 @@ bool Par2Repairer::CreateTargetFiles(void)
       u64 filesize = sourcefile->GetDescriptionPacket()->FileSize();
 
       // Create the target file
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+      if (!targetfile->Create(filename, filesize, true))
+#else
       if (!targetfile->Create(filename, filesize))
+#endif
       {
         delete targetfile;
         return false;
@@ -2075,7 +2601,11 @@ bool Par2Repairer::ComputeRSmatrix(void)
     return false;
 
   // Start iterating through the available recovery packets
+#if WANT_CONCURRENT
+  tbb::concurrent_hash_map<u32, RecoveryPacket*, u32_hasher>::iterator rp = recoverypacketmap.begin();
+#else
   map<u32,RecoveryPacket*>::iterator rp = recoverypacketmap.begin();
+#endif
 
   // Continue to fill the remaining list of data blocks to be read
   while (inputblock != inputblocks.end())
@@ -2127,10 +2657,38 @@ bool Par2Repairer::AllocateBuffers(size_t memorylimit)
   }
 
   // Allocate the two buffers
-  inputbuffer = new u8[(size_t)chunksize];
-  outputbuffer = new u8[(size_t)chunksize * missingblockcount];
+#if GPGPU_CUDA
+  // allocate the GPU output buffers
+  if (rs.has_gpu() && 0 == cuda::AllocateResources(missingblockcount, (size_t) chunksize))
+    rs.set_has_gpu(false);
+#endif
 
-  if (inputbuffer == NULL || outputbuffer == NULL)
+  // Allocate the two buffers
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+  typedef __TBB_TypeWithAlignmentAtLeastAsStrict(u8) element_type;
+  const size_t aligned_chunksize = (sizeof(u8)*(size_t)chunksize+sizeof(element_type)-1)/sizeof(element_type);
+  aligned_chunksize_ = aligned_chunksize;
+  size_t sz = aligned_chunksize * missingblockcount * (DSTOUT?2:1);
+  outputbuffer = tbb::cache_aligned_allocator<u8>().allocate(sz);//new u8[sz];
+#else
+  if (!inputbuffer.alloc((size_t)chunksize))
+  {
+    cerr << "Could not allocate buffer memory." << endl;
+    return false;
+  }
+//inputbuffer = new u8[(size_t)chunksize];
+  outputbuffer = new u8[(size_t)chunksize * missingblockcount * (DSTOUT?2:1)];
+#endif
+
+#if (WANT_CONCURRENT && CONCURRENT_PIPELINE) || DSTOUT
+  outputbuffer_element_state_.resize(missingblockcount);
+#endif
+
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+  if (outputbuffer == NULL)
+#else
+  if ( /* inputbuffer == NULL || */ outputbuffer == NULL)
+#endif
   {
     cerr << "Could not allocate buffer memory." << endl;
     return false;
@@ -2139,13 +2697,158 @@ bool Par2Repairer::AllocateBuffers(size_t memorylimit)
   return true;
 }
 
+#if WANT_CONCURRENT
+
+void* Par2Repairer::OutputBufferAt(u32 outputindex) {
+  #if CONCURRENT_PIPELINE
+  // Select the appropriate part of the output buffer
+  return &((u8*)outputbuffer)[aligned_chunksize_ * outputindex * (DSTOUT?2:1)];
+  #else
+  // Select the appropriate part of the output buffer
+  return &((u8*)outputbuffer)[chunksize * outputindex * (DSTOUT?2:1)];
+  #endif
+}
+
+bool Par2Repairer::ProcessDataForOutputIndex_(u32 outputindex, u32 outputendindex, size_t blocklength,
+                                              u32 inputindex, buffer& inputbuffer) {
+  #if CONCURRENT_PIPELINE
+    int val = (outputbuffer_element_state_[outputindex] -= 2); // 0 -> -2, 1 -> -1
+    if (val < -2) { // index is already in use: defer its processing
+      outputbuffer_element_state_[outputindex] += 2; // undo my changes
+//printf("deferring %u\n", outputindex);
+      return false;
+    }
+    assert(val == -2 || val == -1); // ie, hold lock
+
+    // Select the appropriate part of the output buffer
+    void *outbuf = OutputBufferAt(outputindex);//&((u8*)outputbuffer)[aligned_chunksize_ * outputindex * (DSTOUT?2:1)];
+  #else
+    // Select the appropriate part of the output buffer
+    void *outbuf = OutputBufferAt(outputindex);//&((u8*)outputbuffer)[chunksize * outputindex * (DSTOUT?2:1)];
+    #if DSTOUT
+    int val = outputbuffer_element_state_[outputindex];
+    #endif
+  #endif
+
+  #if DSTOUT
+    void *outbuf2 = outbuf;
+    if (val & 1)
+      (u8*&) outbuf += chunksize;
+    else
+      (u8*&) outbuf2 += chunksize;
+//tbb::tick_count s = tbb::tick_count::now();
+    // Process the data
+    rs.Process(blocklength, inputindex, inputbuffer, outputindex, outbuf, outbuf2);
+    if (val & 1) { // can't use "outputbuffer_element_state_[outputindex] ^= 1" because there is no tbb::atomic<>::operator^=
+      val = (outputbuffer_element_state_[outputindex] -= 1); // flip buffers
+      assert(0 == (val & 1));
+    } else {
+      val = (outputbuffer_element_state_[outputindex] += 1); // flip buffers
+      assert(1 == (val & 1));
+    }
+  #else
+    rs.Process(blocklength, inputindex, inputbuffer, outputindex, outbuf);
+  #endif
+
+  #if CONCURRENT_PIPELINE
+    assert(val < 0);
+    outputbuffer_element_state_[outputindex] += 2; // undo my changes, ie, release lock
+  #endif
+//tbb::tick_count e = tbb::tick_count::now();
+//gti += (unsigned) (1000000.0 * (e-s).seconds());
+
+    if (noiselevel > CommandLine::nlQuiet) {
+      tbb::tick_count now = tbb::tick_count::now();
+      if ((now - last_cout).seconds() >= 0.1) { // only update every 0.1 seconds
+// when building with -O3 under Darwin, using u32 instead of u64 causes incorrect values to be printed :-(
+// I believe it's a compiler codegen bug, but this work-around (using u64 instead of u32) is "good enough".
+        // Update a progress indicator
+        u64 oldfraction = (u64)(1000 * progress / totaldata);
+        progress += blocklength;
+        u64 newfraction = (u64)(1000 * progress / totaldata);
+
+        if (oldfraction != newfraction) {
+//        tbb::mutex::scoped_lock l(cout_mutex);
+          if (0 == cout_in_use.compare_and_swap(outputendindex, 0)) { // <= this version doesn't block - only need 1 thread to write to cout
+            last_cout = now;
+            cout << "Repairing: " << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
+            cout_in_use = 0;
+          }
+        }
+      } else
+        progress += blocklength;
+    }
+    return true;
+}
+
+void Par2Repairer::ProcessDataForOutputIndex(u32 outputindex, u32 outputendindex, size_t blocklength,
+                                             u32 inputindex, buffer& inputbuffer)
+{
+  std::vector<u32> v; // which indexes need deferred processing
+  v.reserve(outputendindex - outputindex);
+
+  for( ; outputindex != outputendindex; ++outputindex )
+    if (!ProcessDataForOutputIndex_(outputindex, outputendindex, blocklength, inputindex, inputbuffer))
+      v.push_back(outputindex);
+
+  // try to process all deferred indexes
+  std::vector<u32> d;
+  do {
+    for (std::vector<u32>::const_iterator vit = v.begin(); vit != v.end(); ++vit) { // which indexes need deferred processing
+      const u32 oi = *vit;
+//printf("trying to process deferred %u\n", oi);
+      if (!ProcessDataForOutputIndex_(oi, outputendindex, blocklength, inputindex, inputbuffer)) {
+        d.push_back(oi); // failed -> try again
+      }
+    }
+    v = d; d.clear();
+  } while (!v.empty());
+}
+
+class ApplyPar2RepairerRSProcess {
+public:
+  ApplyPar2RepairerRSProcess(Par2Repairer* obj, size_t blocklength, u32 inputindex, buffer& inputbuffer) :
+    _obj(obj), _blocklength(blocklength), _inputindex(inputindex), _inputbuffer(inputbuffer) {}
+  void operator()(const tbb::blocked_range<u32>& r) const {
+    _obj->ProcessDataForOutputIndex(r.begin(), r.end(), _blocklength, _inputindex, _inputbuffer);
+  }
+private:
+  Par2Repairer* _obj;
+  size_t        _blocklength;
+  u32           _inputindex;
+  buffer&       _inputbuffer;
+};
+
+void Par2Repairer::ProcessDataConcurrently(size_t blocklength, u32 inputindex, buffer& inputbuffer)
+{
+  if (ALL_SERIAL != concurrent_processing_level) {
+    static tbb::affinity_partitioner ap;
+    tbb::parallel_for(tbb::blocked_range<u32>(0, missingblockcount),
+      ::ApplyPar2RepairerRSProcess(this, blocklength, inputindex, inputbuffer), ap);
+  } else
+    ProcessDataForOutputIndex(0, missingblockcount, blocklength, inputindex, inputbuffer);
+}
+
+#endif
+
 // Read source data, process it through the RS matrix and write it to disk.
 bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
 {
   u64 totalwritten = 0;
 
+#if (WANT_CONCURRENT && CONCURRENT_PIPELINE) // || DSTOUT
   // Clear the output buffer
-  memset(outputbuffer, 0, (size_t)chunksize * missingblockcount);
+  memset(outputbuffer, 0, aligned_chunksize_ * missingblockcount * (DSTOUT?2:1));
+
+  for (size_t i = 0; i != missingblockcount; ++i) {
+    // when outputbuffer_element_state_ contains tbb::atomic<> objects,
+    // they must be manually initialized to zero:
+    outputbuffer_element_state_[i] = 0;
+  }
+#else
+  // Clear the output buffer
+  memset(outputbuffer, 0, (size_t)chunksize * missingblockcount * (DSTOUT?2:1));
+#endif
 
   vector<DataBlock*>::iterator inputblock = inputblocks.begin();
   vector<DataBlock*>::iterator copyblock  = copyblocks.begin();
@@ -2156,6 +2859,71 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
   // Are there any blocks which need to be reconstructed
   if (missingblockcount > 0)
   {
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+//cout << "Repairing using async I/O." << endl;
+    const size_t max_tokens = ALL_SERIAL == concurrent_processing_level ? 1 : tbb::task_scheduler_init::default_num_threads();
+    repair_pipeline_state s(max_tokens, chunksize, missingblockcount, blocklength, blockoffset, inputblocks, copyblocks);
+
+    tbb::pipeline p;
+    repair_filter_read rfr(s);
+    p.add_filter(rfr);
+    repair_filter_process rfp(*this, s);
+    p.add_filter(rfp);
+    //repair_filter_write rfw(*this, s);
+    //p.add_filter(rfw);
+
+    // For repairing, limit # of tokens in flight to the # of hardware threads available.
+    // If too many tokens are used then the async I/O gets deferred until the end of the
+    // repair phase, which nullifies any time advantage gained over using synchronous I/O.
+	p.run(max_tokens);
+
+  #if GPGPU_CUDA
+    if (rs.has_gpu()) {
+    #ifndef NDEBUG
+      CTimeInterval gpp("GPU postprocessing");
+    #endif
+
+      // do xor's of outputbuffers that are on the video card
+      repair_buffer* buf = s.first_available_buffer();
+      if (!buf) {
+        cerr << "Repair failed." << endl;
+        return false;
+      }
+
+      const u32 n = cuda::GetDeviceOutputBufferCount();
+      for (u32 i = 0; i != n; ++i) {
+        if (!cuda::CopyDeviceOutputBuffer(i, (u32*) buf->get())) {
+          cerr << "Failed to copy back data from video card. Repair failed." << endl;
+          return false;
+        }
+        cuda::Xor((u32*) OutputBufferAt(i), (const u32*) buf->get(), (size_t) chunksize);
+      }
+      s.release(buf);
+
+    #ifndef NDEBUG
+      gpp.emit();
+    #endif
+
+      const unsigned pc = cuda::GetProcessingCount();
+      if (0 == pc)
+        cout << "The GPU was not used for processing." << endl;
+      else {
+        u64 fraction = (1000 * (u64) pc) / ((u64) sourceblockcount * (u64) missingblockcount);
+        cout << "The GPU was used for " << fraction/10 << '.' << fraction%10 << "% of the processing (" <<
+          pc << " out of " << ((u64) sourceblockcount * (u64) missingblockcount) << " processing blocks)." << endl;
+      }
+    }
+  #endif
+
+    p.clear();
+
+    if (!s.is_ok()) {
+      cerr << "Repair of data file(s) has failed." << endl;
+      return false;
+    }
+
+    totalwritten = s.totalwritten();
+#else
     // For each input block
     while (inputblock != inputblocks.end())       
     {
@@ -2177,7 +2945,7 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
       }
 
       // Read data from the current input block
-      if (!(*inputblock)->ReadData(blockoffset, blocklength, inputbuffer))
+      if (!(*inputblock)->ReadData(blockoffset, blocklength, inputbuffer.get()))
         return false;
 
       // Have we reached the last source data block
@@ -2189,7 +2957,7 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
           size_t wrote;
 
           // Write the block back to disk in the new target file
-          if (!(*copyblock)->WriteData(blockoffset, blocklength, inputbuffer, wrote))
+          if (!(*copyblock)->WriteData(blockoffset, blocklength, inputbuffer.get(), wrote))
             return false;
 
           totalwritten += wrote;
@@ -2197,15 +2965,28 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
         ++copyblock;
       }
 
+  #if WANT_CONCURRENT
+      ProcessDataConcurrently(blocklength, inputindex, inputbuffer);
+  #else
       // For each output block
       for (u32 outputindex=0; outputindex<missingblockcount; outputindex++)
       {
         // Select the appropriate part of the output buffer
-        void *outbuf = &((u8*)outputbuffer)[chunksize * outputindex];
+        void *outbuf = &((u8*)outputbuffer)[chunksize * outputindex * (DSTOUT?2:1)];
+#if DSTOUT
+        void *outbuf2 = outbuf;
+        if (outputbuffer_element_state_[outputindex])
+          (u8*&) outbuf += chunksize;
+        else
+          (u8*&) outbuf2 += chunksize;
 
         // Process the data
+        rs.Process(blocklength, inputindex, inputbuffer, outputindex, outbuf, outbuf2);
+        outputbuffer_element_state_[outputindex] ^= 1;
+    #else
+        // Process the data
         rs.Process(blocklength, inputindex, inputbuffer, outputindex, outbuf);
-
+    #endif
         if (noiselevel > CommandLine::nlQuiet)
         {
           // Update a progress indicator
@@ -2219,15 +3000,20 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
           }
         }
       }
-
+  #endif
       ++inputblock;
       ++inputindex;
     }
   }
+#endif
   else
   {
     // Reconstruction is not required, we are just copying blocks between files
-
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
+    buffer inputbuffer; // u8 *inputbuffer = new u8[(size_t)chunksize];             // Buffer for reading DataBlocks (chunksize)
+    if (!inputbuffer.alloc((size_t)chunksize))
+      break;
+#endif
     // For each block that might need to be copied
     while (copyblock != copyblocks.end())
     {
@@ -2252,17 +3038,21 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
         }
 
         // Read data from the current input block
-        if (!(*inputblock)->ReadData(blockoffset, blocklength, inputbuffer))
+        if (!(*inputblock)->ReadData(blockoffset, blocklength, inputbuffer.get()))
           return false;
 
         size_t wrote;
-        if (!(*copyblock)->WriteData(blockoffset, blocklength, inputbuffer, wrote))
+        if (!(*copyblock)->WriteData(blockoffset, blocklength, inputbuffer.get(), wrote))
           return false;
         totalwritten += wrote;
       }
 
       if (noiselevel > CommandLine::nlQuiet)
       {
+#if WANT_CONCURRENT
+        tbb::tick_count now = tbb::tick_count::now();
+        if ((now - last_cout).seconds() >= 0.1) { // only update every 0.1 seconds
+#endif
         // Update a progress indicator
         u32 oldfraction = (u32)(1000 * progress / totaldata);
         progress += blocklength;
@@ -2270,8 +3060,15 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
 
         if (oldfraction != newfraction)
         {
+#if WANT_CONCURRENT
+            last_cout = now;
+#endif
           cout << "Processing: " << newfraction/10 << '.' << newfraction%10 << "%\r" << flush;
         }
+#if WANT_CONCURRENT
+        } else
+          progress += blocklength;
+#endif
       }
 
       ++copyblock;
@@ -2292,13 +3089,33 @@ bool Par2Repairer::ProcessData(u64 blockoffset, size_t blocklength)
   vector<DataBlock*>::iterator outputblock = outputblocks.begin();
   for (u32 outputindex=0; outputindex<missingblockcount;outputindex++)
   {
+#if WANT_CONCURRENT && CONCURRENT_PIPELINE
     // Select the appropriate part of the output buffer
-    char *outbuf = &((char*)outputbuffer)[chunksize * outputindex];
+    char *outbuf = &((char*)outputbuffer)[aligned_chunksize_ * outputindex * (DSTOUT?2:1)];
+#else
+    // Select the appropriate part of the output buffer
+    char *outbuf = &((char*)outputbuffer)[chunksize * outputindex * (DSTOUT?2:1)];
+#endif
+#if DSTOUT
+    assert(outputbuffer_element_state_[outputindex] == 0 || outputbuffer_element_state_[outputindex] == 1);
+    if (outputbuffer_element_state_[outputindex])
+      outbuf += chunksize;
+#endif
 
     // Write the data to the target file
     size_t wrote;
+#if defined(WIN32) && WANT_CONCURRENT && CONCURRENT_PIPELINE
+    // on Windows, once a file is opened for async I/O, its handle must always be used for writing using async I/O
+    aiocb_type cb;
+    if (!(*outputblock)->WriteDataAsync(cb, blockoffset, blocklength, outbuf, wrote))
+      return false;
+    cb.suspend_until_completed();
+    if (!cb.completedOK())
+      return false;
+#else
     if (!(*outputblock)->WriteData(blockoffset, blocklength, outbuf, wrote))
       return false;
+#endif
     totalwritten += wrote;
 
     ++outputblock;
@@ -2317,7 +3134,21 @@ bool Par2Repairer::VerifyTargetFiles(string basepath)
 
   // Verify the target files in alphabetical order
   sort(verifylist.begin(), verifylist.end(), SortSourceFilesByFileName);
-
+#if WANT_CONCURRENT_SOURCE_VERIFICATION
+  if (ALL_CONCURRENT == concurrent_processing_level) {
+  #if 1
+    pipeline_state_verify_source_file s(verifylist, finalresult, *this, basepath);
+    tbb::pipeline                     p;
+    filter_verify_target_file         fvtf(s);
+    p.add_filter(fvtf);
+    p.run(tbb::task_scheduler_init::default_num_threads());
+  #else
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, verifylist.size(), 1),
+      ::ApplyVerifyOneTargetFile< vector<Par2RepairerSourceFile*> >(this, verifylist, finalresult));
+  #endif
+  } else for (vector<Par2RepairerSourceFile*>::const_iterator it = verifylist.begin(); it != verifylist.end(); ++it)
+    VerifyOneTargetFile(*it, basepath, finalresult);
+#else
   // Iterate through each file in the verification list
   for (vector<Par2RepairerSourceFile*>::iterator sf = verifylist.begin();
        sf != verifylist.end();
@@ -2358,7 +3189,7 @@ bool Par2Repairer::VerifyTargetFiles(string basepath)
     // Find out how much data we have found
     UpdateVerificationResults();
   }
-
+#endif
   return finalresult;
 }
 
